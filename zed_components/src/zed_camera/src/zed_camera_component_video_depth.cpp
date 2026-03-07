@@ -2473,7 +2473,7 @@ void ZedCamera::publishDisparity(
   }
 }
 
-void ZedCamera::processPointCloud()
+void ZedCamera::processPointCloud(rclcpp::Time frame_ts)
 {
   DEBUG_PC("=== Process Point Cloud ===");
 
@@ -2506,6 +2506,7 @@ void ZedCamera::processPointCloud()
       mPcDataReadyCondVar.notify_one();
       mPcDataReady = true;
       mPcPublishing = true;
+      mPcFrameTimestamp = (frame_ts == TIMEZERO_ROS) ? mFrameTimestamp : frame_ts;
 
       DEBUG_STREAM_PC(
         " * [processPointCloud] Extracted point cloud: " << mMatCloud.getInfos().c_str() );
@@ -2557,10 +2558,10 @@ void ZedCamera::publishPointCloud()
   int ptsCount = width * height;
 
   if (mSvoMode) {
-    pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
+    pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mPcFrameTimestamp;
   } else if (mSimMode) {
     if (mUseSimTime) {
-      pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
+      pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mPcFrameTimestamp;
     } else {
       pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : sl_tools::slTime2Ros(
         mMatCloud.timestamp);

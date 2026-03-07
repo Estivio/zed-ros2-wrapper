@@ -1179,7 +1179,12 @@ void ZedCamera::processDetectedObjects(rclcpp::Time t)
 
   auto objMsg = std::make_unique<zed_msgs::msg::ObjectsStamped>();
 
-  objMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : t;
+  // Prefer SDK's object detection timestamp for accuracy when available
+  rclcpp::Time det_stamp = t;
+  if (objects.timestamp.data_ns != 0) {
+    det_stamp = sl_tools::slTime2Ros(objects.timestamp, get_clock()->get_clock_type());
+  }
+  objMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : det_stamp;
   objMsg->header.frame_id = mLeftCamFrameId;
 
   objMsg->objects.resize(objCount);

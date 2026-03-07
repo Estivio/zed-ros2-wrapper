@@ -348,7 +348,12 @@ void ZedCamera::processBodies(rclcpp::Time t)
 
   auto bodyMsg = std::make_unique<zed_msgs::msg::ObjectsStamped>();
 
-  bodyMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : t;
+  // Prefer SDK's body tracking timestamp for accuracy when available
+  rclcpp::Time bt_stamp = t;
+  if (bodies.timestamp.data_ns != 0) {
+    bt_stamp = sl_tools::slTime2Ros(bodies.timestamp, get_clock()->get_clock_type());
+  }
+  bodyMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : bt_stamp;
   bodyMsg->header.frame_id = mLeftCamFrameId;
 
   bodyMsg->objects.resize(bodyCount);

@@ -17,9 +17,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <sl/Camera.hpp>
 #include <sl/Fusion.hpp>
 #include <unordered_set>
+#include <utility>
 
 #include "sl_version.hpp"
 #include "sl_tools.hpp"
@@ -211,6 +213,10 @@ protected:
   // ----> Thread functions
   // Main thread
   void threadFunc_zedGrab();
+  // Post-processing worker thread for DECOUPLED mode
+  void threadFunc_postProcessing();
+  void enqueuePostProcJob(const rclcpp::Time & frame_ts);
+  bool popNextPostProcJob(rclcpp::Time & frame_ts, double & lag_sec);
 
   // Video/Depth thread
   void threadFunc_videoDepthElab();
@@ -291,7 +297,7 @@ protected:
   void checkRgbDepthSync();
   bool checkGrabAndUpdateTimestamp(rclcpp::Time & out_pub_ts);
 
-  void processPointCloud();
+  void processPointCloud(rclcpp::Time frame_ts = TIMEZERO_ROS);
   bool isPointCloudSubscribed();
   void publishPointCloud();
   void publishImuFrameAndTopic();
@@ -371,6 +377,13 @@ protected:
   // <---- Utility functions
 
 private:
+  // Processing mode for heavy computational tasks (point cloud, object detection, body tracking)
+  enum class ProcessingMode : int
+  {
+    INLINE = 0,     // Process in the grab thread (default)
+    DECOUPLED = 1   // Process in a separate worker thread
+  };
+
   // ZED SDK
   std::shared_ptr<sl::Camera> mZed;
   sl::InitParameters mInitParams;
@@ -649,6 +662,8 @@ private:
   int mThreadPrioGrab = 50;
   int mThreadPrioSens = 70;
   int mThreadPrioPointCloud = 60;
+  ProcessingMode mProcessingMode = ProcessingMode::INLINE;
+  int mPostProcQueueSize = 1;
 
   std::atomic<bool> mStreamingServerRequired;
   sl::STREAMING_CODEC mStreamingServerCodec = sl::STREAMING_CODEC::H264;
@@ -958,6 +973,7 @@ private:
   sl::ERROR_CODE mConnStatus;
   sl::FUSION_ERROR_CODE mFusionStatus = sl::FUSION_ERROR_CODE::MODULE_NOT_ENABLED;
   std::thread mGrabThread;        // Main grab thread
+  std::thread mPostProcThread;    // Decoupled post processing worker
   std::thread mVdThread;          // Video and Depth data processing thread
   std::thread mPcThread;          // Point Cloud publish thread
   std::thread mSensThread;        // Sensors data publish thread
@@ -987,6 +1003,9 @@ private:
   std::mutex mVdMutex;
   std::condition_variable mVdDataReadyCondVar;
   std::atomic_bool mVdDataReady;
+  std::mutex mPostProcMutex;
+  std::condition_variable mPostProcDataReadyCondVar;
+  std::deque<rclcpp::Time> mPostProcJobs;
   // <---- Thread Sync
 
   // ----> Status Flags
@@ -1084,6 +1103,10 @@ private:
   bool mBaroPublishing = false;
   bool mObjDetSubscribed = false;
   bool mBodyTrkSubscribed = false;
+  std::atomic<size_t> mPostProcQueueDepth{0};
+  std::atomic<uint64_t> mPostProcDroppedJobs{0};
+  std::atomic<double> mPostProcLagMax_sec{0.0};
+  std::unique_ptr<sl_tools::WinAvg> mPostProcLagMean_sec;
 
   diagnostic_updater::Updater mDiagUpdater;  // Diagnostic Updater
 
@@ -1116,6 +1139,7 @@ private:
   rclcpp::Time mLastTs_pose;
   rclcpp::Time mLastTs_pc;
   rclcpp::Time mPrevTs_pc;
+  rclcpp::Time mPcFrameTimestamp;
   uint64_t mLastTs_gnss_nsec = 0;
   rclcpp::Time mLastClock;
   // <---- Timestamps

@@ -291,6 +291,9 @@ void ZedCamera::deInitNode()
   if (!mThreadStop) {
     mThreadStop = true;
   }
+  mPostProcDataReadyCondVar.notify_all();
+  mVdDataReadyCondVar.notify_all();
+  mPcDataReadyCondVar.notify_all();
 
   DEBUG_COMM("Waiting for sensors thread...");
   try {
@@ -321,6 +324,16 @@ void ZedCamera::deInitNode()
     DEBUG_STREAM_COMM("Pointcloud thread joining exception: " << e.what());
   }
   DEBUG_COMM("... Point Cloud thread stopped");
+
+  DEBUG_COMM("Waiting for post-processing thread...");
+  try {
+    if (mPostProcThread.joinable()) {
+      mPostProcThread.join();
+    }
+  } catch (std::system_error & e) {
+    DEBUG_STREAM_COMM("Post-processing thread joining exception: " << e.what());
+  }
+  DEBUG_COMM("... post-processing thread stopped");
 
   DEBUG_COMM("Waiting for grab thread...");
   try {
@@ -1167,6 +1180,27 @@ void ZedCamera::getGeneralParams()
     shared_from_this(), "general.async_image_retrieval",
     mAsyncImageRetrieval, mAsyncImageRetrieval,
     " * Asynchronous image retrieval: ");
+
+  std::string processing_mode = "INLINE";
+  sl_tools::getParam(
+    shared_from_this(), "general.processing_mode",
+    processing_mode, processing_mode, " * Processing mode: ");
+  if (processing_mode == "DECOUPLED") {
+    mProcessingMode = ProcessingMode::DECOUPLED;
+  } else if (processing_mode == "INLINE") {
+    mProcessingMode = ProcessingMode::INLINE;
+  } else {
+    mProcessingMode = ProcessingMode::INLINE;
+    RCLCPP_WARN_STREAM(
+      get_logger(),
+      "Invalid value for 'general.processing_mode': '" << processing_mode <<
+        "'. Using default 'INLINE'.");
+  }
+
+  sl_tools::getParam(
+    shared_from_this(), "general.postproc_queue_size",
+    mPostProcQueueSize, mPostProcQueueSize,
+    " * Post-processing queue size: ", false, 1, 64);
 
   sl_tools::getParam(
     shared_from_this(), "general.enable_image_validity_check",
@@ -3517,6 +3551,7 @@ bool ZedCamera::startCamera()
     mFrameTimestamp =
       sl_tools::slTime2Ros(mZed->getTimestamp(sl::TIME_REFERENCE::IMAGE));
   }
+  mPcFrameTimestamp = mFrameTimestamp;
   // <---- Timestamp
 
   // ----> Initialize Diagnostic statistics
@@ -3541,6 +3576,7 @@ bool ZedCamera::startCamera()
   mPubPoseTF_sec = std::make_unique<sl_tools::WinAvg>(mSensPubRate);
   mPubImuTF_sec = std::make_unique<sl_tools::WinAvg>(mSensPubRate);
   mGnssFix_sec = std::make_unique<sl_tools::WinAvg>(10);
+  mPostProcLagMean_sec = std::make_unique<sl_tools::WinAvg>(mCamGrabFrameRate);
   // <---- Initialize Diagnostic statistics
 
   if (mGnssFusionEnabled) {
@@ -3675,6 +3711,10 @@ void ZedCamera::initThreads()
     mPcThread = std::thread(&ZedCamera::threadFunc_pointcloudElab, this);
   }
   // <---- Start Pointcloud thread
+
+  if (mProcessingMode == ProcessingMode::DECOUPLED) {
+    mPostProcThread = std::thread(&ZedCamera::threadFunc_postProcessing, this);
+  }
 
   // Start grab thread
   mGrabThread = std::thread(&ZedCamera::threadFunc_zedGrab, this);
@@ -5082,7 +5122,12 @@ void ZedCamera::threadFunc_zedGrab()
       processVideoDepth();
       // <---- Retrieve Image/Depth data if someone has subscribed to
 
-      if (!mDepthDisabled) {
+      const bool decoupled_postproc = (mProcessingMode == ProcessingMode::DECOUPLED);
+      if (decoupled_postproc && !mDepthDisabled) {
+        enqueuePostProcJob(mFrameTimestamp);
+      }
+
+      if (!mDepthDisabled && !decoupled_postproc) {
         // ----> Retrieve the point cloud if someone has subscribed to
         DEBUG_STREAM_GRAB("Grab thread: retrieving Point Cloud data");
         processPointCloud();
@@ -5138,7 +5183,7 @@ void ZedCamera::threadFunc_zedGrab()
         // <---- Localization processing
       }
 
-      if (!mDepthDisabled) {
+      if (!mDepthDisabled && !decoupled_postproc) {
         DEBUG_STREAM_GRAB("Grab thread: Object Detection processing");
         {
           std::lock_guard<std::mutex> lock(mObjDetMutex);
@@ -5197,6 +5242,92 @@ void ZedCamera::threadFunc_zedGrab()
   mHeartbeatTimer->cancel();
 
   DEBUG_STREAM_COMM("Grab thread finished");
+}
+
+void ZedCamera::enqueuePostProcJob(const rclcpp::Time & frame_ts)
+{
+  std::lock_guard<std::mutex> lock(mPostProcMutex);
+
+  // Drop old frames when queue is full to minimize latency
+  if (static_cast<int>(mPostProcJobs.size()) >= mPostProcQueueSize) {
+    mPostProcDroppedJobs.fetch_add(mPostProcJobs.size());
+    mPostProcJobs.clear();
+  }
+
+  mPostProcJobs.emplace_back(frame_ts);
+  mPostProcQueueDepth = mPostProcJobs.size();
+  mPostProcDataReadyCondVar.notify_one();
+}
+
+bool ZedCamera::popNextPostProcJob(rclcpp::Time & frame_ts, double & lag_sec)
+{
+  std::unique_lock<std::mutex> lock(mPostProcMutex);
+
+  while (mPostProcJobs.empty()) {
+    if (mPostProcDataReadyCondVar.wait_for(lock, std::chrono::milliseconds(500)) == std::cv_status::timeout) {
+      if (mThreadStop || !rclcpp::ok()) {
+        return false;
+      }
+    }
+  }
+
+  frame_ts = mPostProcJobs.front();
+  mPostProcJobs.pop_front();
+  mPostProcQueueDepth = mPostProcJobs.size();
+  lock.unlock();
+
+  lag_sec = std::max(0.0, (get_clock()->now() - frame_ts).seconds());
+  mPostProcLagMean_sec->addValue(lag_sec);
+
+  double max_lag = mPostProcLagMax_sec.load();
+  while (lag_sec > max_lag && !mPostProcLagMax_sec.compare_exchange_weak(max_lag, lag_sec)) {
+  }
+
+  return true;
+}
+
+void ZedCamera::threadFunc_postProcessing()
+{
+  DEBUG_STREAM_COMM("Post-processing thread started");
+  pthread_setname_np(pthread_self(), (get_name() + std::string("_postProc")).c_str());
+
+  while (1) {
+    if (!rclcpp::ok() || mThreadStop) {
+      break;
+    }
+
+    rclcpp::Time frame_ts = TIMEZERO_ROS;
+    double lag_sec = 0.0;
+    if (!popNextPostProcJob(frame_ts, lag_sec)) {
+      break;
+    }
+
+    if (mThreadStop) {
+      break;
+    }
+
+    if (!mDepthDisabled) {
+      processPointCloud(frame_ts);
+
+      {
+        std::lock_guard<std::mutex> lock(mObjDetMutex);
+        if (mObjDetRunning) {
+          processDetectedObjects(frame_ts);
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(mBodyTrkMutex);
+        if (mBodyTrkRunning) {
+          processBodies(frame_ts);
+        }
+      }
+
+      processRtRoi(frame_ts);
+    }
+  }
+
+  DEBUG_STREAM_COMM("Post-processing thread finished");
 }
 
 bool ZedCamera::publishSensorsData(rclcpp::Time force_ts)
@@ -8490,6 +8621,20 @@ void ZedCamera::callback_updateDiagnostic(
       stat.add("Input mode", "LOCAL STREAM");
     } else {
       stat.add("Input mode", "Live Camera");
+    }
+
+    stat.add(
+      "Processing mode",
+      mProcessingMode == ProcessingMode::DECOUPLED ? "DECOUPLED" : "INLINE");
+    if (mProcessingMode == ProcessingMode::DECOUPLED) {
+      stat.addf("Post-processing queue", "%zu", mPostProcQueueDepth.load());
+      stat.addf(
+        "Post-processing dropped jobs", "%llu",
+        static_cast<unsigned long long>(mPostProcDroppedJobs.load()));
+      if (mPostProcLagMean_sec) {
+        stat.addf("Post-processing lag", "Mean %.6f sec - Max %.6f sec",
+          mPostProcLagMean_sec->getAvg(), mPostProcLagMax_sec.load());
+      }
     }
 
     if (mVdPublishing) {
