@@ -1186,11 +1186,11 @@ void ZedCamera::getGeneralParams()
     shared_from_this(), "general.processing_mode",
     processing_mode, processing_mode, " * Processing mode: ");
   if (processing_mode == "DECOUPLED") {
-    mProcessingMode = ProcessingMode::DECOUPLED;
+    mProcessingMode = ProcessingMode::DECOUPLED_MODE;
   } else if (processing_mode == "INLINE") {
-    mProcessingMode = ProcessingMode::INLINE;
+    mProcessingMode = ProcessingMode::INLINE_MODE;
   } else {
-    mProcessingMode = ProcessingMode::INLINE;
+    mProcessingMode = ProcessingMode::INLINE_MODE;
     RCLCPP_WARN_STREAM(
       get_logger(),
       "Invalid value for 'general.processing_mode': '" << processing_mode <<
@@ -3712,7 +3712,7 @@ void ZedCamera::initThreads()
   }
   // <---- Start Pointcloud thread
 
-  if (mProcessingMode == ProcessingMode::DECOUPLED) {
+  if (mProcessingMode == ProcessingMode::DECOUPLED_MODE) {
     mPostProcThread = std::thread(&ZedCamera::threadFunc_postProcessing, this);
   }
 
@@ -5122,7 +5122,7 @@ void ZedCamera::threadFunc_zedGrab()
       processVideoDepth();
       // <---- Retrieve Image/Depth data if someone has subscribed to
 
-      const bool decoupled_postproc = (mProcessingMode == ProcessingMode::DECOUPLED);
+      const bool decoupled_postproc = (mProcessingMode == ProcessingMode::DECOUPLED_MODE);
       if (decoupled_postproc && !mDepthDisabled) {
         enqueuePostProcJob(mFrameTimestamp);
       }
@@ -8625,8 +8625,8 @@ void ZedCamera::callback_updateDiagnostic(
 
     stat.add(
       "Processing mode",
-      mProcessingMode == ProcessingMode::DECOUPLED ? "DECOUPLED" : "INLINE");
-    if (mProcessingMode == ProcessingMode::DECOUPLED) {
+      mProcessingMode == ProcessingMode::DECOUPLED_MODE ? "DECOUPLED" : "INLINE");
+    if (mProcessingMode == ProcessingMode::DECOUPLED_MODE) {
       stat.addf("Post-processing queue", "%zu", mPostProcQueueDepth.load());
       stat.addf(
         "Post-processing dropped jobs", "%llu",

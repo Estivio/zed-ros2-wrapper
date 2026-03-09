@@ -380,8 +380,8 @@ private:
   // Processing mode for heavy computational tasks (point cloud, object detection, body tracking)
   enum class ProcessingMode : int
   {
-    INLINE = 0,     // Process in the grab thread (default)
-    DECOUPLED = 1   // Process in a separate worker thread
+    INLINE_MODE = 0,     // Process in the grab thread (default)
+    DECOUPLED_MODE = 1   // Process in a separate worker thread
   };
 
   // ZED SDK
@@ -662,7 +662,7 @@ private:
   int mThreadPrioGrab = 50;
   int mThreadPrioSens = 70;
   int mThreadPrioPointCloud = 60;
-  ProcessingMode mProcessingMode = ProcessingMode::INLINE;
+  ProcessingMode mProcessingMode = ProcessingMode::INLINE_MODE;
   int mPostProcQueueSize = 1;
 
   std::atomic<bool> mStreamingServerRequired;
